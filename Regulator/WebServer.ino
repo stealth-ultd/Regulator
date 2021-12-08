@@ -1,16 +1,11 @@
+// ** webserver module allows remote monitoring **
 
-enum struct RestRequest {
+enum struct RestRequest { // this list is shortened
   INDEX = 'I',
   EVENTS = 'E',
   STATS = 'C',
   CSV_LIST = 'L',
   ALARM = 'A',
-  PUMP_ALARM_RESET = 'X',
-  MANUAL_RUN = 'H',
-  VALVES_BACK = 'V',
-  BALBOA_PAUSE = 'B',
-  PLAN_CHANGE = 'P',
-  EXT_PLAN_CHANGE = 'W',
   SAVE_EVENTS = 'S'
 };
 
@@ -32,17 +27,15 @@ void webServerLoop() {
       fn[l] = 0;
       while (client.read() != -1);
       if (l == 1) {
-        strcpy(fn, "/index.html");
+        strcpy(fn, "/index.htm");
       }
+      
       if (msg.length() > 0) {
         msg.print(' ');
       }
-      msg.print(fn);
-#ifndef FS
+
       char buff[64];
-#else
-      char buff[1024];
-#endif
+
       ChunkedPrint chunked(client, buff, sizeof(buff));
       if (l <= 3 && strchr("IECLAPHVBSXW", fn[1])) {
         webServerRestRequest(fn[1], fn[2], chunked);
@@ -80,32 +73,6 @@ void webServerRestRequest(char cmd, char param, ChunkedPrint& chunked) {
     case RestRequest::ALARM:
       printAlarmJson(chunked);
       break;
-    case RestRequest::PUMP_ALARM_RESET:
-      alarmCause = AlarmCause::NOT_IN_ALARM;
-      state = RegulatorState::MONITORING;
-      printAlarmJson(chunked);
-      break;
-    case RestRequest::MANUAL_RUN:
-      manualRunRequest = !manualRunRequest;
-      manualRunLoop();
-      printValuesJson(chunked);
-      break;
-    case RestRequest::VALVES_BACK:
-      valvesBackStart(0);
-      printValuesJson(chunked);
-      break;
-    case RestRequest::BALBOA_PAUSE:
-      balboaManualPause();
-      printValuesJson(chunked);
-      break;
-    case RestRequest::PLAN_CHANGE:
-      powerPilotSetPlan(param - '0');
-      printValuesJson(chunked);
-      break;
-    case RestRequest::EXT_PLAN_CHANGE:
-      extHeaterPlan = param - '0';
-      printValuesJson(chunked);
-      break;
     case RestRequest::SAVE_EVENTS:
       eventsSave();
       eventsPrintJson(chunked);
@@ -119,13 +86,6 @@ void webServerServeFile(const char *fn, BufferedPrint& bp) {
 #ifdef FS
   char* ext = strchr(fn, '.');
   if (sdCardAvailable) {
-    if (strlen(ext) > 4) {
-      ext[4] = 0;
-      memmove(ext + 2, ext, 5);
-      ext[0] = '~';
-      ext[1] = '1';
-      ext += 2;
-    }
     File dataFile = SD.open(fn);
     if (dataFile) {
       notFound = false;
@@ -170,23 +130,22 @@ void webServerServeFile(const char *fn, BufferedPrint& bp) {
 }
 
 void printValuesJson(FormattedPrint& client) {
-  client.printf(F("{\"st\":\"%c\",\"v\":\"%s\",\"r\":\"%d %d %d %d %d\",\"p\":%d,\"ec\":%d,\"ts\":%d,\"cp\":%d,\"eh\":%d"),
-      state, version, mainRelayOn, bypassRelayOn, extHeaterIsOn, balboaRelayOn, valvesBackRelayOn, powerPilotPlan,
-      eventsRealCount(false), valvesBackBoilerTemperature(), statsConsumedPowerToday(), extHeaterPlan);
+  client.printf(F("{\"st\":\"%c\",\"v\":\"%s\",\"r\":\"%d\",\"h\":%d,\"m\":%d,\"i\":%d,\"sol\":%d,\"trs\":%d,\"ec\":%d"),
+      state, version, bypassRelayOn, heatingPower, meterPower, inverterAC, insolPowerAvg, tresholdAvg, eventsRealCount(false)); // eventscount is new <<<<<<<<<<
   byte errCount = eventsRealCount(true);
   if (errCount) {
     client.printf(F(",\"err\":%d"), errCount);
-  }
+  }  
   switch (state) {
     case RegulatorState::MANUAL_RUN:
-      client.printf(F(",\"mr\":%u"), manualRunMinutesLeft());
-      /* no break */
+      client.printf(F(",\"cp\":%d"), statsManualPowerToday());
+      break;
     case RegulatorState::REGULATING:
-    case RegulatorState::OVERHEATED:
-      client.printf(F(",\"h\":%d"), heatingPower);
-      /* no break */
     case RegulatorState::MONITORING:
-      client.printf(F(",\"m\":%d,\"i\":%d,\"soc\":%d,\"b\":%d"), meterPower, inverterAC, pvSOC, pvChargingPower);
+      client.printf(F(",\"cp\":%d"), statsRegulatedPowerToday());
+      break;
+    case RegulatorState::ACCUMULATE:
+      client.printf(F(",\"cp\":%d"), statsAccumulatedPowerToday());
       break;
     default:
       break;
@@ -206,8 +165,8 @@ void printAlarmJson(FormattedPrint& client) {
     case AlarmCause::NETWORK:
       eventIndex = NETWORK_EVENT;
       break;
-    case AlarmCause::PUMP:
-      eventIndex = PUMP_EVENT;
+    case AlarmCause::MQTT:
+      eventIndex = MQTT_EVENT;
       break;
     case AlarmCause::MODBUS:
       eventIndex = MODBUS_EVENT;
@@ -219,6 +178,7 @@ void printAlarmJson(FormattedPrint& client) {
   }
   client.print('}');
 }
+
 
 const char* getContentType(const char* ext){
   if (!strcmp(ext, ".html") || !strcmp(ext, ".htm"))
