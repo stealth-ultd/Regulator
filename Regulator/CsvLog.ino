@@ -32,35 +32,31 @@ void csvLogSetup() {
 
 void csvLogLoop() {
 
-#ifdef FS
   static char buff[2000];
   static CStringBuilder lines(buff, sizeof(buff));
 
   unsigned long t = now();
 
-  if (lines.length() > sizeof(buff) - 100 || (!mainRelayOn && lines.length())) {
+  if (lines.length() > sizeof(buff) - 100 || (state == RegulatorState::MONITORING && lines.length())) { // OR expression now included
     char fn[20];
     sprintf(fn, "%s%02d-%02d-%02d.CSV", CSV_DIR, year(t) - 2000, month(t), day(t));
     File file = FS.open(fn, FILE_WRITE);
     if (file) {
       if (file.size() == 0) {
-        file.println(F("t;h;m;soc;b;raw;s;f;v;i;sm;eh"));
+        file.println(F("t;HP;insolP;invAC;metAC;trhld;insolR;elsP;V;"));
       }
       file.print(buff);
       file.close();
-    } else {
-      msg.print(F(" file error"));
     }
     lines.reset();
   }
 
-  if (state == RegulatorState::REGULATING || state == RegulatorState::OVERHEATED) {
-    lines.printf(F("%02d:%02d:%02d;%d;%d;%d;%d;%d;%d;%d;%d;%d;%d;%d\r\n"), hour(t), minute(t), second(t),
-        heatingPower, meterPower, pvSOC, pvChargingPower, powerPilotRaw, elsens, elsensPower,
-        voltage, inverterAC, measuredPower, (int) extHeaterIsOn);
+if (state == RegulatorState::REGULATING) { 
+    lines.printf(F("%02d:%02d:%02d;%03d;%04d;%04d;%05d;%04d;%04d;%03d;%03d\r\n"), hour(t), minute(t), second(t),
+        heatingPower, insolPowerAvg, inverterAC, meterPower, insol, tresholdAvg, elsensPower, voltage);
   }
-#endif
 }
+
 
 void csvLogPrintJson(FormattedPrint& out) {
 #ifdef FS
