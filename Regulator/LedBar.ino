@@ -1,10 +1,12 @@
+// ** The ledbar with alarm status and ElSens power consumption **
+
 #include <Grove_LED_Bar.h>
 
 Grove_LED_Bar ledBar(LEDBAR_CLOCK_PIN, LEDBAR_DATA_PIN, true);
 
 void ledBarSetup() {
   ledBar.begin();
-
+  
   // indicate startup
   ledBar.setLed(5, 1);
   ledBar.setLed(6, 1);
@@ -29,7 +31,7 @@ void ledBarLoop() {
   switch (state) {
     case RegulatorState::ALARM:
       switch (alarmCause) {
-        case AlarmCause::PUMP:
+        case AlarmCause::MQTT:
           level = 1;
           break;
         case AlarmCause::NETWORK:
@@ -42,37 +44,31 @@ void ledBarLoop() {
           break;
       }
       break;
-    case RegulatorState::OVERHEATED:
-      level = (float) overheatedSecondsLeft() / 60; // number of minutes
-      break;
     case RegulatorState::REGULATING:
-      level = MAX_LEVEL_LED - MAX_LEVEL_LED * ((float) (MAX_POWER - heatingPower) / MAX_POWER);
+        level = MAX_LEVEL_LED - MAX_LEVEL_LED * ((float) (MAX_POWER - elsensPower) / MAX_POWER); // setPower
       break;
     case RegulatorState::MANUAL_RUN:
-      level = (float) manualRunMinutesLeft() / 15; // number of quarter-hours
-      break;
+        level = MAX_LEVEL_LED - MAX_LEVEL_LED * ((float) (MAX_POWER - elsensPower) / MAX_POWER); // setPower
+      break;  
     default:
       break;
   }
   ledBar.setLevel(level);
   if (bypassRelayOn) {
-    ledBar.setLed(BYPASS_LED, state == RegulatorState::MANUAL_RUN && blinkLedState ? 0.5 : 1);
+    ledBar.setLed(BYPASS_LED, state == RegulatorState::ACCUMULATE && blinkLedState ? 0.5 : 1);
   }
-  if (valvesBackExecuted()) {
-    ledBar.setLed(5, valvesBackRelayOn ? 1 : 0.25);
-  }
+
+if (state == RegulatorState::ACCUMULATE) {
+    ledBar.setLed(BYPASS_LED, 0.5);
+  }  
+
   if (state == RegulatorState::ALARM) {
     ledBar.setLed(ALARM_LED, 1);
-  }
+  } 
+
   if (blinkLedState) {
     ledBar.setLed(BLINK_LED, 0.75);
-    if (state == RegulatorState::OVERHEATED) {
-      ledBar.setLed(ALARM_LED, 0.75);
-    }
   } else {
     ledBar.setLed(BLINK_LED, 0.25);
-    if (balboaRelayOn) {
-      ledBar.setLed(ALARM_LED, 0.75);
-    }
   }
 }
