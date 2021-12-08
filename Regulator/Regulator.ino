@@ -1,47 +1,108 @@
-#include "arduino_secrets.h"
+// Arduino IDE: 1.8.16 && SAMD Boards Package 1.8.11 - https://github.com/arduino/ArduinoCore-samd/releases
+// if bricked press reset button twice fast
+
+/******************************************************************************
+                               --- TA Regulator ---
+
+ DIY Arduino consumption regulator build to use excess solar power for charging
+ a storage heater ("thermal battery") as means to enhance PV self-consumption
+ ratio.
+ 
+ It is based on the Regulator sketch as developed by Juraj Andrássy:
+ https://github.com/jandrassy/Regulator. Check his version first – it provides
+ many additional modules and functionalities that are not included in this
+ version and is excellently set up, allowing for case-by-case modification.        
+ 
+ This TA Regulator version has been tuned for "zero export" PV restriction,
+ basically demanding a different mechanism to estheblish how much PV excess
+ power exists, as any excess is by default suppressed by the export limiter and
+ therefore not visible as surplus to the meter. To establish this untapped PV,
+ a small reference PV panel placed next to the PV array is used. It tells how
+ much PV (W) is potentially available from the sun through the "insolPower"
+ value, derived from the shortcut current of the panel. This functionality is
+ set up in the InSol module.
+ 
+ ModBus data from the PV inverter and smartmeter are then used to see how much
+ much PV is currently generated and consumed. The difference tells the untapped
+ excess PV, which is then "regulated" as heating power for the storage heater.
+ 
+ TA Regulator features MQTT, through which the heating power can be set
+ independently ("manual") from the automatically regulated power. If power is
+ set through MQTT, automatic regulation is disabled.
+ 
+ A "night charging" function has been integrated through which a given amount
+ of kWh can be set for over-night accumulatiuon in the heater, using cheap night
+ tariff. It is enabled/disabled over a long press of the button. The level of
+ night charge is determined with a weather prediction algorithm. With sunny
+ skies predicted, the charge level is lower, with worsening or overcast skies
+ the charge level is brought up. This is done through the ChargeForecast module.
+ 
+ Functionality for an OLED display (128 x 64 or 128 x 128) is included, as well
+ as a Led Matrix screen. Screens are switched off during night, but can get
+ activated with a short pressing of the button.
+ 
+ The platform used is ARDUINO_SAMD_MKRZERO with MKR Connector Carrier and ETH
+ Shield. It can be made compatible with other platforms through by including
+ platform specific instructions available from the original Regulator sketch.
+
+ Hardware modifications made: a larger heatsink is connetced to the RobotDyn
+ triac module (to prevent overheating), a subber is connected to the triac
+ module (to prevent blowing-out the triac), and EMI line filters are put on
+ the incoming and outgoing power line (to prevent distortion on the AC line
+ from the dimmer regulation).
+ 
+ packages required:
+ StreamLib.h
+ TimeLib.h
+ MemoryFree.h
+ ArduinoOTA.h
+ TriacLib.h
+ RTCZero.h
+ lcdgfx.h
+ avdweb_AnalogReadFast.h
+ Grove_LED_Bar.h
+ PubSubClient.h
+ WDTZero.h
+ Adafruit_Sensor.h
+ Adafruit_BME280.h
+ Encoder.h
+ Adafruit_LEDBackpack.h
+                             
+******************************************************************************/
+
 #include <StreamLib.h>
-#include <TimeLib.h>
+#include <TimeLib.h> // conflicts with RTCZero if Time.h is not removed: https://github.com/arduino-libraries/RTCZero/issues/28
 #include <MemoryFree.h> // https://github.com/mpflaga/Arduino-MemoryFree
-#include <Ethernet.h> //Ethernet 2.00 for all W5000
-//#include <EthernetENC.h> // for ENC28j60
-byte mac[] = SECRET_MAC;
+
+#include <Ethernet.h>
 #define ETHERNET
+
+boolean MQTT_ON = false; // "true" activates the MQTT modules for manual regulation, check TA-Pilot and MQTT module
+
 #include <SD.h>
 #define FS SD
-#define NO_OTA_PORT
+
 #include <ArduinoOTA.h>
 
-#if defined(ARDUINO_ARCH_SAMD)
-#define NO_EEPROM
-#else
-#include <EEPROM.h>
-#endif
+#define NO_EEPROM // ARDUINO_ARCH_SAMD
 
+#include "const.h"
 #include <TriacLib.h>
 
-#define BLYNK_PRINT Serial
-#define BLYNK_NO_BUILTIN // Blynk doesn't handle pins
-#define BLYNK_MAX_SENDBYTES 256
-#define BLYNK_USE_128_VPINS
-#include <BlynkSimpleEthernet.h>
+#include <Wire.h>
 
-#ifdef ARDUINO_ARCH_SAMD
-#include <RTCZero.h>
+#include <RTCZero.h> // ARDUINO_ARCH_SAMD
 RTCZero rtc;
-#endif
 
-#include "consts.h"
-
-#ifdef ETHERNET
 #define NetServer EthernetServer
 #define NetClient EthernetClient
-#else
-#define NetServer WiFiServer
-#define NetClient WiFiClient
-#endif
 
 unsigned long loopStartMillis;
 byte hourNow; // current hour
+byte minuteNow; // current minute
+boolean setClock = false; // RTC is synchronised at BEGIN_HOUR daytime operation
+const int BEGIN_HOUR = 8 ; // 08:00 start daytime operation
+const int END_HOUR = 24; // 24:00 end daytime operation
 
 const char* LOG_FN = "EVENTS.LOG";
 
@@ -49,42 +110,41 @@ RegulatorState state = RegulatorState::MONITORING;
 AlarmCause alarmCause = AlarmCause::NOT_IN_ALARM;
 
 boolean buttonPressed = false;
-boolean manualRunRequest = false; // manual run start or stop request
-unsigned long valvesOpeningStartMillis;
+boolean nightCall = false;
+int chargeSetRatio = 100; // ratio of charge depending on AccForecast 0-100
+int chargeSetLevel; // the aimed charge level from forecast
 
-boolean mainRelayOn = false;
+long displayReport = 0; // delay in updating display
+
 boolean bypassRelayOn = false;
-boolean valvesBackRelayOn = false;
-boolean balboaRelayOn = false;
-
-int freeMem;
 
 // SunSpec Modbus values
-int pvChargingPower; // battery charging power
-int pvSOC; //state of charge
-bool pvBattCalib; // true if Symo calibrates the battery
 int meterPower; // smart meter measured power
+int meterPowerAvg; // averaged measured power
 int meterPowerPhaseA;
 int meterPowerPhaseB;
 int meterPowerPhaseC;
-int voltage; // smart meter measured AC voltage
+int voltage = 230; // smart meter measured AC voltage
 int inverterAC; // inverter AC power
+boolean inverterThrottled = false;
 
 // PowerPilot values
-byte powerPilotPlan = BATTERY_PRIORITY;
+int stateRelay; // this is nightCall (1/0) set via MQTT
+int setPower = 0; // the desired power (W) via MQTT
+
 int heatingPower;
 int powerPilotRaw;
+int tresholdAvg; // averaged "overdraw" protection treshold
+boolean pilotThrottled = false; // prevention of draw on PV underperformance (snow, etc.)
 
-//ElSens values (for logging and UI)
-int elsens; // el.sensor measurement
-int elsensPower; // power calculation
+//ElSens values (ACS712 current sensor for logging and UI)
+int elsens; // raw sensor measurement
+int elsensPower; // TA power consumption calculation
 
-//external meter measurement
-int measuredPower;
-
-// additional heater control over Wemo Inside smart socket
-byte extHeaterPlan = EXT_HEATER_DISABLED;
-bool extHeaterIsOn = true; // assume is on to turn it off in loop
+// InSol values (PV panel insolation for excess calculation)
+int insol; // raw ADC measurement of Ishortcut from panel
+int insolPower; // available measured PV power calculation
+int insolPowerAvg; // averaged insolPower
 
 char msgBuff[256];
 CStringBuilder msg(msgBuff, sizeof(msgBuff));
@@ -98,31 +158,40 @@ void sdTimeCallback(uint16_t* date, uint16_t* time) {
 }
 #endif
 
+
+/******************************************************************************
+*                                 --- SETUP ---                               *
+******************************************************************************/
+
 void setup() {
-  pinMode(MAIN_RELAY_PIN, OUTPUT);
-  pinMode(PUMP_RELAY_PIN, OUTPUT);
-  pinMode(BYPASS_RELAY_PIN, OUTPUT);
-  digitalWrite(BYPASS_RELAY_PIN, LOW);
 
-  pilotSetup();
-  elsensSetup();
-  buttonSetup();
-  ledBarSetup();
-//  statusLedSetup();
-  balboaSetup();
+// setup solid state relay for bypass
+    pinMode(BYPASS_RELAY_PIN, OUTPUT);
+    digitalWrite(BYPASS_RELAY_PIN, LOW);
 
-  Serial.begin(115200);
+// deselect the SD card on eth shield
+   pinMode(4,OUTPUT);
+   digitalWrite(4, HIGH);
+
+    Wire.begin();
+    Wire.setClock(400000); // 400000
+  
+    pilotSetup();
+    elsensSetup();
+    insolSetup();
+    chargeForecastSetup();
+    buttonSetup();
+    ledBarSetup();
+    ledMatrixSetup();
+    displaySetup();
+  
+// setup serial communication
+    Serial.begin(115200);  // TX can be used if Serial is not used
 
   beep();
 
-#ifdef ARDUINO_ARCH_SAMD
   rtc.begin();
   setTime(rtc.getEpoch());
-#endif
-
-  Serial.println(version);
-  Serial.print(F("mem "));
-  Serial.println(freeMemory());
 
 #ifdef __SD_H__
   pinMode(NET_SS_PIN, OUTPUT);
@@ -132,108 +201,105 @@ void setup() {
   } else {
     SdFile::dateTimeCallback(sdTimeCallback);
     sdCardAvailable = true;
-    Serial.println(F("SD card initialized"));
-#if defined(ARDUINO_AVR_ATMEGA1284)
-    // clear the update file as soon as possible
-    SDStorage.setUpdateFileName("FIRMWARE.BIN");
-    SDStorage.clear(); // AVR SD bootloaders don't delete the update file
-#endif
+  } 
+#endif    
+
+//  setup internet connection, status is checked in loop
+    IPAddress ip(192, 168, 0, 61);
+    Ethernet.init(NET_SS_PIN);
+    Ethernet.begin(mac, ip);
+    delay(150);
+
+    ArduinoOTA.beforeApply(shutdown);
+    ArduinoOTA.begin(ip, "TA-pilot", "11000", InternalStorage);
+
+//  set DAC resulution to full 1024
+    analogWriteResolution(10); // default is 8 bits (0-256)
+    
+  if (MQTT_ON) {
+    MQTTSetup();
   }
-#endif
+  
+    webServerSetup();
+    modbusSetup();
+    eventsSetup();
+    statsSetup();
+    csvLogSetup();
+    watchdogSetup();
+ 
+  }
 
-  IPAddress ip(192, 168, 1, 6);
-  Ethernet.init(NET_SS_PIN);
-  Ethernet.begin(mac, ip);
-  delay(500);
-  // connection is checked in loop
+/******************************************************************************
+*                                 --- LOOP ---                                *
+******************************************************************************/
 
-  ArduinoOTA.beforeApply(shutdown);
-#if defined(ARDUINO_AVR_ATMEGA1284) // app binary is larger then half of the flash
-  ArduinoOTA.begin(ip, "regulator", "password", SDStorage);
-#else
-  ArduinoOTA.begin(ip, "regulator", "password", InternalStorage);
-#endif
+void loop() {   
+    
+    loopStartMillis = millis();
+    hourNow = hour();
+    minuteNow = minute();
 
-#if defined(ARDUINO_ARCH_SAMD)
-  analogWriteResolution(10);
-#endif
+    handleSuspendAndOff();
+    statsLoop();
 
-  msg.print(F("start"));
+    watchdogLoop();
+    ArduinoOTA.poll();
+    eventsLoop();
+    
+//  user interface
+    buttonPressed = false;
+    buttonLoop();
+    beeperLoop();
+    ledBarLoop();
 
-  beep();
+// display control    
+    if (loopStartMillis - displayReport > 2000) { // display update timer 2 sec
+    displayReport = loopStartMillis;
+    displayLoop();
+    ledMatrixLoop();
+    }
+    if (buttonPressed == true) { // show display if button is pressed
+    displayLoop();
+    ledMatrixLoop();
+    }
 
-  valvesBackSetup();
-  telnetSetup();
-  blynkSetup();
-  webServerSetup();
-  modbusSetup();
-  eventsSetup();
-  statsSetup();
-  csvLogSetup();
-  watchdogSetup();
+    webServerLoop();
+    
+    if (handleAlarm())
+      return;
 
-  beep();
+    if (!networkConnected())
+      return;
+    
+    if (!modbusLoop()) // returns true if data-set is ready, otherwise breaks loop
+      return;
+      
+    if (MQTT_ON) {
+      if (!mqttConnected()) // if not critical this can be done once a day
+        return;
+    }
+     
+    elsensLoop();
+
+    insolLoop();
+
+    chargeForecastLoop();
+         
+    if (MQTT_ON) {
+       MQTTLoop();
+    }
+
+    pilotLoop();
+
+    csvLogLoop();
+
+    syncRTC();
+    
 }
 
-void loop() {
-
-  freeMem = freeMemory();
-  loopStartMillis = millis();
-  hourNow = hour();
-
-  handleRelaysOnStates();
-  statsLoop();
-
-  watchdogLoop();
-  ArduinoOTA.handle();
-  eventsLoop();
-
-  // user interface
-  buttonPressed = false;
-  buttonLoop();
-  beeperLoop(); // alarm sound
-//  statusLedLopp();
-  ledBarLoop();
-  blynkLoop();
-  webServerLoop();
-  telnetLoop(msg.length() != 0); // checks input commands and prints msg
-  if (msg.length()) {
-    log(msgBuff);
-  }
-  msg.reset();  //clear msg
-
-  if (handleAlarm())
-    return;
-
-  manualRunLoop();
-
-  valvesBackLoop();
-
-  if (restHours())
-    return;
-
-  if (!networkConnected())
-    return;
-
-  if (!modbusLoop()) // returns true if data-set is ready
-    return;
-
-  susCalibLoop();
-
-  elsensLoop();
-//  wemoLoop();
-  consumptionMeterLoop();
-
-  extHeaterLoop();
-  pilotLoop();
-
-  battSettLoop();
-  balboaLoop();
-
-  telnetLoop(true); // logs modbus and heating data
-  csvLogLoop();
-  blynkChartData();
-}
+/************************************************************************
+*                           --- FUNCTIONS ---                           *
+************************************************************************/
 
 void shutdown() {
   eventsSave();
@@ -241,41 +307,9 @@ void shutdown() {
   watchdogLoop();
 }
 
-void handleRelaysOnStates() {
-
-  static unsigned long lastOn = 0; // millis for the cool-down timer
-
-  if (state == RegulatorState::OPENING_VALVES && loopStartMillis - valvesOpeningStartMillis > VALVE_ROTATION_TIME) {
-    state = RegulatorState::MONITORING;
-    turnPumpRelayOn();
-  }
-  if (state != RegulatorState::REGULATING && state != RegulatorState::MANUAL_RUN) {
+void handleSuspendAndOff() {
+  if (state != RegulatorState::REGULATING && state != RegulatorState::ACCUMULATE) {
     heatingPower = 0;
-  }
-  if (heatingPower > 0 || state == RegulatorState::OPENING_VALVES) {
-    lastOn = loopStartMillis;
-  } else if (mainRelayOn) { // && heatingPower == 0
-    powerPilotStop();
-    if (bypassRelayOn) {
-      msg.print(F(" BR_off"));
-      waitZeroCrossing();
-      digitalWrite(BYPASS_RELAY_PIN, LOW);
-      bypassRelayOn = false;
-    }
-    if (loopStartMillis - lastOn > PUMP_STOP_MILLIS) {
-      msg.print(F(" MR_off"));
-      waitZeroCrossing();
-      digitalWrite(PUMP_RELAY_PIN, LOW);
-      waitZeroCrossing();
-      delay(5);
-      digitalWrite(MAIN_RELAY_PIN, LOW);
-      mainRelayOn = false;
-    }
-  }
-  if (extHeaterIsOn //
-      && ((state != RegulatorState::REGULATING && state != RegulatorState::OVERHEATED) || extHeaterPlan == EXT_HEATER_DISABLED) //
-      && networkConnected()) {
-    extHeaterStop();
   }
 }
 
@@ -284,34 +318,35 @@ void clearData() {
   powerPilotRaw = 0;
   elsens = 0;
   elsensPower = 0;
-  measuredPower = 0;
+  insol = 0;
+  insolPower = 0; 
 }
 
 boolean handleAlarm() {
 
   static unsigned long modbusCheckMillis;
   const unsigned long MODBUS_CHECK_INTERVAL = 5000;
-
+  
   if (alarmCause == AlarmCause::NOT_IN_ALARM)
     return false;
   if (state != RegulatorState::ALARM) {
     state = RegulatorState::ALARM;
     clearData();
-    balboaReset();
-    msg.printf(F("alarm %c"), (char) alarmCause);
   }
   boolean stopAlarm = false;
   switch (alarmCause) {
+    
     case AlarmCause::NETWORK:
-#ifdef ETHERNET
       stopAlarm = (Ethernet.linkStatus() != LinkOFF);
-#else
-      stopAlarm = (WiFi.status() == WL_CONNECTED);
-#endif
       break;
-    case AlarmCause::PUMP:
-      stopAlarm = buttonPressed;
+    if (MQTT_ON) {
+      case AlarmCause::MQTT:
+      stopAlarm = (mqttConnected() != false); 
       break;
+    }
+      case AlarmCause::TRIAC:
+      stopAlarm = (elsensCheckTriac() != false); 
+      break;        
     case AlarmCause::MODBUS:
       if (millis() - modbusCheckMillis > MODBUS_CHECK_INTERVAL) {
         stopAlarm = requestSymoRTC() && requestMeter(); // meter is off in Symo emergency power mode
@@ -324,93 +359,76 @@ boolean handleAlarm() {
   if (stopAlarm) {
     alarmCause = AlarmCause::NOT_IN_ALARM;
     state = RegulatorState::MONITORING;
+    displayClear();
   }
   return !stopAlarm;
 }
 
-boolean restHours() {
+boolean nightChargeHours() {
 
-  const unsigned long MIN_VALID_TIME = SECS_YR_2000 + SECS_PER_YEAR;
-  const int BEGIN_HOUR = 8;
-  const int END_HOUR = 22; // to monitor discharge
+// daytime operation window
 
-  if (now() < MIN_VALID_TIME || balboaRelayOn)
-    return false;
-
+// (1) return false if within daytime operation window
   if (hourNow >= BEGIN_HOUR && hourNow < END_HOUR) {
-    if (state == RegulatorState::REST) {
-      requestSymoRTC(); // every morning sync clock
-      if (hour() < BEGIN_HOUR)  // sync can set the clock back, then would the powerPlan reset
-        return true;
-      state = RegulatorState::MONITORING;
-#ifdef FS
-      FS.remove(LOG_FN);
-#endif
+    if (state == RegulatorState::ACCUMULATE) { // terminate ACCUMULATE if within daytime operation window
+
+        if (bypassRelayOn) { // switch off bypass relay if ACCUMULATE get terminated
+        waitZeroCrossing();
+        digitalWrite(BYPASS_RELAY_PIN, LOW);
+        bypassRelayOn = false;
+        }
+      return true;
     }
     return false;
   }
-  if (state == RegulatorState::MONITORING) {
-    state = RegulatorState::REST;
-    clearData();
-    powerPilotSetPlan(BATTERY_PRIORITY);
-    extHeaterPlan = EXT_HEATER_DISABLED;
+
+// (2) switch to ACCUMULATE if not in daytime operation window
+ 
+  if (state == RegulatorState::MONITORING && nightCall) {
+    setPower = 0; //
   }
   return true;
 }
 
-boolean turnMainRelayOn() {
-  if (state == RegulatorState::OPENING_VALVES)
-    return false;
-  if (mainRelayOn)
+boolean turnBypassRelayOn() {
+  if (bypassRelayOn)
     return true;
-  bool valvesAreOpen = !valvesBackExecuted(); // before valvesBackReset()
-  valvesBackReset();
-  msg.print(F(" MR_on"));
-  digitalWrite(MAIN_RELAY_PIN, HIGH);
-  mainRelayOn = true;
-  if (valvesAreOpen)
-    return turnPumpRelayOn();
-  state = RegulatorState::OPENING_VALVES;
-  valvesOpeningStartMillis = loopStartMillis;
-  return false;
-}
-
-bool turnPumpRelayOn() {
-  if (!mainRelayOn) {
-    msg.print(F(" PR_err"));
-    return false;
-  }
-  msg.print(F(" PR_on"));
-  waitZeroCrossing();
-  digitalWrite(PUMP_RELAY_PIN, HIGH);
-  return elsensCheckPump();
+  digitalWrite(BYPASS_RELAY_PIN, HIGH);
+  bypassRelayOn = true;
 }
 
 boolean networkConnected() {
   static int tryCount = 0;
-#ifdef ETHERNET
   if (Ethernet.linkStatus() != LinkOFF) {
-#else
-  if (WiFi.status() == WL_CONNECTED) {
-#endif
     tryCount = 0;
     return true;
   }
   tryCount++;
   if (tryCount == 30) {
     alarmCause = AlarmCause::NETWORK;
-#ifdef ETHERNET
     eventsWrite(NETWORK_EVENT, Ethernet.linkStatus(), 0);
-#else
-    eventsWrite(NETWORK_EVENT, WiFi.status(), 0);
-#endif
   }
   return false;
+}
+
+void syncRTC() {
+  if (hourNow = BEGIN_HOUR) { // optional add: && minuteNow == 0
+    if (setClock = false) {
+    requestSymoRTC(); // every morning sync clock
+    setClock = true;
+      if (hour() < BEGIN_HOUR)  // sync can set the clock back           
+        FS.remove(LOG_FN);
+     }
+  }
+  if (hourNow > BEGIN_HOUR) {
+    setClock = false;
+  }
 }
 
 void waitZeroCrossing() {
   Triac::waitZeroCrossing();
 }
+
 
 void log(const char *msg) {
 #ifdef FS
@@ -424,4 +442,5 @@ void log(const char *msg) {
     file.close();
   }
 #endif
+
 }
