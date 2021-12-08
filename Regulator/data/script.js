@@ -2,7 +2,7 @@
 var host = location.hostname;
 var restPort = 80;
 if (host == "") {
-  host = "192.168.1.6";
+  host = "192.168.0.61";
 }
 
 function onLoad(cmd) {
@@ -17,7 +17,7 @@ function onLoad(cmd) {
       showStats(xhr.responseText);
     } else if (cmd == "L") {
       showCsvFilesList(xhr.responseText);
-    } else if (cmd == "A" || cmd == "X") {
+    } else if (cmd == "A") {
       showAlarm(xhr.responseText);
       //{"a":2,"t":1501962011,"v1":262,"v2":200,"c":1}
     } else {
@@ -28,13 +28,9 @@ function onLoad(cmd) {
   xhr.send();
 }
 
-var valueLabels = {"err" : "Errors", "mr" : "Manual run", "st" : "State", "r" : "Relays", "h" : "Heating", "m" : "Meter", 
-    "b" : "Battery", "i" : "Inverter", "soc" : "SoC", "ec" : "Events", "cp" : "Consumed", "ts" : "Boiler temp.", 
-    "csv" : "CSV Files", "v" : "Version", "p" : "PowerPilot Plan", "eh" : "Ext. Heater Plan"};
-var stateLabels = {"N" : "rest", "M" : "monitoring", "R" : "regulating", "O" : "OVERHEAT", "H" : "manual run", "A" : "ALARM", "V" : "VALVES"};
-var alarmLabels = {"-" : "No alarm", "N" : "Network", "P" : "Pump", "M" : "MODBUS"};
-var planLabels  = ["Battery has priority (default)", "Heating has priority AM", "Disable heating AM", "Disable heating"];
-var extHeaterPlanLabels  = ["Ext. heater disabled", "Use ext. heater"];
+var valueLabels = {"err" : "Errors", "mr" : "Manual run", "st" : "State", "h" : "Power", "r" : "Bypass", "sol" : "InsolAv", "i" : "Inverter", "m" : "Meter", "trs" : "Treshold", "ec" : "Events", "cp" : "Energy", "csv" : "CSV Files"};
+var stateLabels = {"M" : "monitoring", "R" : "regulating", "Y" : "accumulate", "H" : "manual run", "A" : "ALARM"};
+var alarmLabels = {"-" : "No alarm", "N" : "Network", "Q" : "MQTT", "M" : "MODBUS"};
 
 function showValues(jsonData) {
   var data = JSON.parse(jsonData);
@@ -52,46 +48,41 @@ function showValues(jsonData) {
       val = stateLabels[val];
     } else if (key == "csv") {
       val = "list";
-    } else if (key == "soc") {
-      unit = "%";
+    } else if (key == "cp") {
+      unit = " Wh";
     } else if (key == "mr") {
       unit = " min.";
     } else if (key == "ts") {
       unit = "°C";
-    } else if (key == "h" || key == "m" || key == "b" || key == "i" || key == "cp") {
+    } else if (key == "h" || key == "m" || key == "b" || key == "i" || key == "sol") {
       unit = " W";
     }
     var boxDiv = document.createElement("DIV");
     if (key == "ec" || key == "err" || key == "cp" || key == "csv" || (key == "st" && val == "ALARM")) {
       boxDiv.className = "value-box value-box-clickable";
-    } else if (key == "v" || key == "p" || key == "eh") {
+    } else if (key == "v" || key == "p") {
       boxDiv.className = "value-box value-box-double";
     } else {
       boxDiv.className = "value-box";
     }
     boxDiv.appendChild(createTextDiv("value-label", valueLabels[key]));
-    if (key == "p") {
-      boxDiv.appendChild(createDropDownListDiv(planLabels, val, "P"));
-    } else if (key == "eh") {
-      boxDiv.appendChild(createDropDownListDiv(extHeaterPlanLabels, val, "W"));
-    } else {
-      boxDiv.appendChild(createTextDiv("value-value", val + unit));
-    }
+    
+    boxDiv.appendChild(createTextDiv("value-value", val + unit));
     if (key == 'ec' || key == 'err') {
       boxDiv.onclick = function() {
-        location = "events.html";
+        location = "events.htm";
       }
     } else if (key == "cp") {
         boxDiv.onclick = function() {
-          location = "stats.html";
+          location = "stats.htm";
         }
     } else if (key == "csv") {
         boxDiv.onclick = function() {
-          location = "csvlst.html";
+          location = "csvlst.htm";
         }
     } else if (key == "st" && val == "ALARM") {
       boxDiv.onclick = function() {
-        location = "alarm.html";
+        location = "alarm.htm";
       }
     }
     contentDiv.appendChild(boxDiv);
@@ -104,17 +95,11 @@ function showValues(jsonData) {
       contentDiv.insertBefore(createCommandBox("Manual run", "Stop", "H"), contentDiv.firstElementChild);
     }
   }
-  var s = data["r"];
-  if (s.charAt(0) == "0" && s.charAt(6) == "0") {
-    contentDiv.appendChild(createCommandBox("Valves", "Back", "V"));
-  }
-  var balboaRelayOn = (s.charAt(4) == "1");
-  contentDiv.appendChild(createCommandBox("Balboa pause", balboaRelayOn ? "Off" : "On", "B"));
 }
 
 var eventHeaders = ["timestamp", "event", "value 1", "value 2", "count"];
-var eventLabels = ["Events", "Restart", "Watchdog", "Network", "Pump problem", "MODBUS error", "Overheat", "Balboa pause", "Manual run", "Valves back", "Suspend calibration", "BattSett", "PowerPilot plan", "Ext Heater", "Stats save"];
-var eventIsError = [false,    false,     true,       true,      true,           true,           false,      false,           false,       false,         false,                 false,      false,             true,         false];
+var eventLabels = ["Events", "Restart", "Watchdog", "Network", "MQTT", "Modbus", "Stats.save"];
+var eventIsError = [false, false, true, true, true, true, false];
 
 function showEvents(jsonData) {
   var data = JSON.parse(jsonData);
@@ -180,32 +165,35 @@ function showStats(jsonData) {
   statsHeaderDiv.className = "table-header";
   var date = new Date(data["timestamp"] * 1000);
   statsHeaderDiv.appendChild(createTextDiv("table-header-cell", date.toDateString()));
-  statsHeaderDiv.appendChild(createTextDiv("table-header-cell", "time (h:mm)"));
-  statsHeaderDiv.appendChild(createTextDiv("table-header-cell", "consumed (W)"));
-  statsHeaderDiv.appendChild(createTextDiv("table-header-cell", "average (W)"));
+  statsHeaderDiv.appendChild(createTextDiv("table-header-cell", "kWh"));
   contentDiv.appendChild(statsHeaderDiv);
-  contentDiv.appendChild(buildStatsRow("Day heating", data["dayHeatingTime"], data["dayConsumedPower"], true));
-  contentDiv.appendChild(buildStatsRow("Month heating", data["monthHeatingTime"], data["monthConsumedPower"], true));
-  contentDiv.appendChild(buildStatsRow("Day external", data["dayExtHeatingTime"], data["dayExtConsumedPower"], false));
-  contentDiv.appendChild(buildStatsRow("Month external", data["monthExtHeatingTime"], data["monthExtConsumedPower"], false));
-  contentDiv.appendChild(buildStatsRow("Day manual-run", data["dayManualRunTime"], data["dayManualRunPower"], false));
-  contentDiv.appendChild(buildStatsRow("Month manual-run", data["monthManualRunTime"], data["monthManualRunPower"], false));
+  contentDiv.appendChild(buildStatsRow("REG (D)", data["dayConsumedPower"], true));
+  contentDiv.appendChild(buildStatsRow("REG (M)", data["monthConsumedPower"], true));
+  contentDiv.appendChild(buildStatsRow("REG (Y)", data["yearConsumedPower"], true));
+  contentDiv.appendChild(buildStatsRow("ACC (D)", data["dayAccumulatePower"], false));
+  contentDiv.appendChild(buildStatsRow("ACC (M)", data["monthAccumulatePower"], false));
+  contentDiv.appendChild(buildStatsRow("ACC (Y)", data["yearAccumulatePower"], false));
+  contentDiv.appendChild(buildStatsRow("MAN (D)", data["dayManualRunPower"], false));
+  contentDiv.appendChild(buildStatsRow("MAN (M)", data["monthManualRunPower"], false));
+  contentDiv.appendChild(buildStatsRow("MAN (Y)", data["yearManualRunPower"], false));
+  
   var fn = data["fn"];
   if (fn.length > 0) {
     contentDiv.appendChild(createButton(fn, fn));
   }
 }
 
-function buildStatsRow(label, heatingTime, consumedPower, showAverage) {
+function buildStatsRow(label, kWhPower) {
   var div = document.createElement("DIV");
   div.className = "table-row";
   div.appendChild(createTextDiv("table-cell", label));
-  var h = Math.floor(heatingTime / 60);
-  var m = Math.floor(heatingTime - h * 60);
-  div.appendChild(createTextDiv("table-cell", h + ":" + ("" + m).padStart(2, "0")));
-  div.appendChild(createTextDiv("table-cell table-cell-number", consumedPower));
-  div.appendChild(createTextDiv("table-cell table-cell-number", ((showAverage && heatingTime) != 0) ? Math.floor(consumedPower / (heatingTime/60)) : ""));
+  div.appendChild(createTextDiv("table-cell", round(kWhPower/1000, 1)));
   return div;
+}
+
+function round(value, precision) {
+    var multiplier = Math.pow(10, precision || 0);
+    return Math.round(value * multiplier) / multiplier;
 }
 
 function showCsvFilesList(jsonData) {
@@ -281,7 +269,7 @@ function createButton(text, command) {
 
 function createDropDownListDiv(values, index, command) {
   var div = document.createElement("DIV");
-  div.className = "value-control";
+  div.className = "value-value";
   var select = document.createElement("SELECT");
   var l;
   for (l of values) {
@@ -302,7 +290,7 @@ function createCommandBox(title, label, command) {
   boxDiv.className = "value-box";
   boxDiv.appendChild(createTextDiv("value-label", title));
   var div = document.createElement("DIV");
-  div.className = "value-control";
+  div.className = "value-value";
   div.appendChild(createButton(label, command));
   boxDiv.appendChild(div);
   return boxDiv;
