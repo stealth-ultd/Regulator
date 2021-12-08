@@ -1,96 +1,56 @@
-#ifdef ARDUINO_ARCH_SAMD
-#include <avdweb_AnalogReadFast.h>
-#endif
+// ** The ACS712 current sensor reporting on TA-Regulator consumption on AC line in **
 
-const int ELSENS_ANALOG_MIDDLE_VALUE = 512;
+#include <avdweb_AnalogReadFast.h> // https://www.avdweb.nl/arduino/adc-dac/fast-10-bit-adc
 
-const unsigned long OVERHEATED_COOLDOWN_TIME = PUMP_STOP_MILLIS - 30000; // resume 30 sec before pump stops
-
-unsigned long overheatedStart = 0;
+const int ELSENS_ANALOG_MIDDLE_VALUE = 2048; // half value of 12-bit 4096
 
 void elsensSetup() {
+    analogReadResolution(12); // added for ADC with avdweb_AnalogReadFast.h, 10 bit = 2^10 or 1024
 }
 
 void elsensLoop() {
 
-  const int PUMP_POWER = 40;
-
   // system's power factor characteristics
-  const float PF_ANGLE_INTERVAL = PI * 0.33;
-  const float PF_ANGLE_SHIFT = PI * 0.22;
+  const float PF_ANGLE_INTERVAL = PI * 0.20; // 0.22
+  const float PF_ANGLE_SHIFT = PI * 0.31; // 0.286
 
-#ifdef ARDUINO_SAMD_MKRZERO
   // ACS712 20A analogReadFast over MKR Connector Carrier A pin's voltage divider with capacitor removed
-  const int ELSENS_MAX_VALUE = 1500;
-  const float ELSENS_VALUE_COEF = 1.86;
-#else
-  // 5 V ATmega 'analog' pin and ACS712 sensor 20A version
-  const int ELSENS_MAX_VALUE = 2000;
-  const float ELSENS_VALUE_COEF = 1.31;
-#endif
-  const int ELSENS_VALUE_SHIFT = 100;
-  const int ELSENS_MIN_HEATING_VALUE = 250;
+  const int ELSENS_MAX_VALUE = 760; // W
+  const float ELSENS_VALUE_COEF = 2.99; // 1.86
 
-  // waiting for water to cooldown
-  if (overheatedStart != 0) {
-    if (state == RegulatorState::OVERHEATED && (loopStartMillis - overheatedStart) < OVERHEATED_COOLDOWN_TIME && !buttonPressed)
-      return;
-    overheatedStart = 0;
-    state = RegulatorState::MONITORING;
-  }
+  const int ELSENS_VALUE_SHIFT = 5; // this represents the base load (+/ 5 Watt)
+  const int ELSENS_MIN_HEATING_VALUE = 40; // this sets the "noise" level
 
   elsens = readElSens();
 
-  if (heatingPower > 0 && elsens < ELSENS_MIN_HEATING_VALUE) {
-    overheatedStart = loopStartMillis;
-    state = RegulatorState::OVERHEATED;
-    msg.print(F("overheated"));
-    eventsWrite(OVERHEATED_EVENT, elsens, heatingPower);
-    alarmSound();
-  }
-
   if (elsens > ELSENS_MIN_HEATING_VALUE) {
     float ratio = 1.0 - ((float) elsens / ELSENS_MAX_VALUE); // to 'guess' the 'power factor'
-    elsensPower = (int) (elsens * ELSENS_VALUE_COEF * cos(PF_ANGLE_SHIFT + ratio * PF_ANGLE_INTERVAL)) + ELSENS_VALUE_SHIFT;
-  } else {
-    elsensPower = mainRelayOn ? PUMP_POWER : 0;
+    elsensPower = (int) ((elsens * ELSENS_VALUE_COEF * cos(PF_ANGLE_SHIFT + ratio * PF_ANGLE_INTERVAL)) + ELSENS_VALUE_SHIFT);
+  }
+  else {
+    elsensPower = 0;
   }
 }
 
-boolean elsensCheckPump() {
+boolean elsensCheckTriac() { // alerts if TRIAC has shorted out
 
-  const int ELSENS_MIN_ON_VALUE = 40;
-
-  delay(1000); // pump run-up
-  int v = readElSens();
-  if (v < ELSENS_MIN_ON_VALUE) {
-    digitalWrite(PUMP_RELAY_PIN, LOW);
-    waitZeroCrossing();
-    digitalWrite(MAIN_RELAY_PIN, LOW);
-    mainRelayOn = false;
-    alarmCause = AlarmCause::PUMP;
-    eventsWrite(PUMP_EVENT, v, ELSENS_MIN_ON_VALUE);
+  const int TRIAC_MAX_TRESHOLD = 50 + (heatingPower * 1.2); 
+  if (elsens > TRIAC_MAX_TRESHOLD) {
+    alarmCause = AlarmCause::TRIAC;
+    eventsWrite(TRIAC_EVENT, elsens, TRIAC_MAX_TRESHOLD);
     return false;
   }
   return true;
 }
 
-byte overheatedSecondsLeft() {
-  return (OVERHEATED_COOLDOWN_TIME - (loopStartMillis - overheatedStart)) / 1000;
-}
+int readElSens() { // return value is RMS of sampled values
 
-/**
- * return value is RMS of sampled values
- */
-int readElSens() {
-
-  // set 1 for Grove El. sensor CT
-  const int RMS_INT_SCALE = 10;
+  const float RMS_INT_SCALE = 2.5; // c2.5 for 12 bit ADC, 10 for 10 bit ADC
 
   unsigned long long sum = 0;
   int n = 0;
   unsigned long start_time = millis();
-  while (millis() - start_time < 200) { // in 200 ms measures 10 50Hz AC oscillations
+  while (millis() - start_time < 200) { // in 200 ms measures 10 50Hz AC oscillations // was 200
     long v = (short) elsensAnalogRead() - ELSENS_ANALOG_MIDDLE_VALUE;
     sum += v * v;
     n++;
@@ -114,10 +74,5 @@ void elsensWaitZeroCrossing() {
 }
 
 unsigned short elsensAnalogRead() {
-#if ARDUINO_ARCH_SAMD
   return analogReadFast(ELSENS_PIN);
-#else
-  return analogRead(ELSENS_PIN);
-#endif
 }
-
